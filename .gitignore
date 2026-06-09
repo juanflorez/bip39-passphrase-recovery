@@ -1,0 +1,11 @@
+# Never commit recovery working files — they describe your seed/passphrase space.
+candidates.txt
+xpubs.csv
+*.csv
+out*.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
