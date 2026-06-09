@@ -27,8 +27,13 @@ Caveats:
 import argparse
 import csv
 import json
+import re
 import subprocess
 import sys
+from collections import defaultdict
+
+sys.path.insert(0, __file__.rsplit("/", 1)[0])
+from derive_xpubs import _b58check_decode, _hash160  # noqa: E402
 
 # Plain local bitcoin-cli. Override with --cli for a custom datadir/conf or a
 # `sudo -u bitcoin bitcoin-cli ...` wrapper on a multi-user host.
@@ -40,6 +45,57 @@ DESC_TEMPLATES = {
     84: "wpkh({x}/{c}/*)",
     86: "tr({x}/{c}/*)",
 }
+
+# scantxoutset returns each unspent's desc in RESOLVED form, e.g.
+#   wpkh([f2def583/0/1]02f51d...bf0)#gfawmhpl
+# i.e. the derived pubkey plus a [key-origin-fingerprint/chain/index] tag —
+# NOT the input xpub. So we attribute hits by that fingerprint, not by
+# substring-matching the xpub (which never matches once a UTXO is found).
+_ORIGIN_RE = re.compile(r"\[([0-9a-fA-F]{8})/")
+
+
+def xpub_fingerprint(xpub):
+    """The 4-byte key-origin fingerprint bitcoind prints for this xpub:
+    hash160(serialized pubkey)[:4]. The pubkey is the last 33 bytes of the
+    78-byte BIP32 serialization."""
+    return _hash160(_b58check_decode(xpub)[-33:])[:4].hex()
+
+
+def _desc_purpose(desc):
+    if desc.startswith("sh(wpkh("):
+        return 49
+    if desc.startswith("wpkh("):
+        return 84
+    if desc.startswith("pkh("):
+        return 44
+    if desc.startswith("tr("):
+        return 86
+    return None
+
+
+def attribute_unspents(rows, unspents):
+    """Map found UTXOs back to candidates via key-origin fingerprint + script
+    type. Returns (totals, unmapped) where totals maps (cand, purpose, account)
+    -> [amount, utxo_count] and unmapped is a list of descs we couldn't place."""
+    fp_map = defaultdict(list)
+    for cand, purpose, account, xpub in rows:
+        fp_map[(xpub_fingerprint(xpub), purpose)].append((cand, purpose, account))
+
+    totals, unmapped = {}, []
+    for u in unspents:
+        m = _ORIGIN_RE.search(u["desc"])
+        owners = fp_map.get((m.group(1).lower(), _desc_purpose(u["desc"])), []) if m else []
+        if not owners:
+            unmapped.append(u["desc"])
+            continue
+        if len(owners) > 1:  # astronomically rare fingerprint+type collision
+            print(f"note: fingerprint {m.group(1)} matches {len(owners)} "
+                  "candidates — verify each line number below")
+        for owner in owners:
+            t = totals.setdefault(owner, [0.0, 0])
+            t[0] += float(u["amount"])
+            t[1] += 1
+    return totals, unmapped
 
 
 def cli(cli_prefix, *args, stdin_args=None):
@@ -81,7 +137,6 @@ def main():
     if not rows:
         sys.exit("no xpubs in CSV")
 
-    xpub_map = {x: (cand, purpose, account) for cand, purpose, account, x in rows}
     scanobjects = []
     for _, purpose, _, xpub in rows:
         for chain in (0, 1):  # receive + change
@@ -98,16 +153,9 @@ def main():
 
     if not result.get("success"):
         sys.exit("scan did not complete successfully")
-    totals = {}
-    for u in result.get("unspents", []):
-        owner = next((xpub_map[x] for x in xpub_map if x in u["desc"]), None)
-        if owner is None:
-            print(f"warning: could not map unspent to a candidate: {u['desc']}")
-            continue
-        key = owner
-        totals.setdefault(key, [0.0, 0])
-        totals[key][0] += float(u["amount"])
-        totals[key][1] += 1
+    totals, unmapped = attribute_unspents(rows, result.get("unspents", []))
+    for desc in unmapped:
+        print(f"warning: could not map unspent to a candidate: {desc}")
 
     print(f"\nScan complete (height {result['height']}, "
           f"total found: {result.get('total_amount', 0)} BTC)\n")
